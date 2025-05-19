@@ -17,6 +17,8 @@ import os
 import gc
 import numpy as np
 from tqdm import tqdm
+from ultralytics.utils.torch_utils import select_device
+from ultralytics.utils import LOGGER, TQDM, colorstr
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -25,7 +27,7 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size per GPU')
     parser.add_argument('--img-size', type=int, default=640, help='Image size')
-    parser.add_argument('--device', type=str, default='cuda', help='Device to use')
+    parser.add_argument('--device', type=str, default='', help='Device to use (cuda device, i.e. 0 or 0,1,2,3 or cpu)')
     parser.add_argument('--workers', type=int, default=8, help='Number of workers')
     parser.add_argument('--save-dir', type=str, default='runs/train', help='Directory to save results')
     parser.add_argument('--local_rank', type=int, default=-1, help='Local rank for distributed training')
@@ -52,8 +54,11 @@ def validate(model, val_loader, args, device):
     stats = []
     metrics = DetMetrics()
     
+    pbar = enumerate(val_loader)
+    pbar = tqdm(pbar, total=len(val_loader), bar_format=TQDM.bar_format)
+    
     with torch.no_grad():
-        for imgs, targets in tqdm(val_loader, desc='Validating'):
+        for i, (imgs, targets) in pbar:
             imgs = imgs.to(device)
             targets = targets.to(device)
             
@@ -86,11 +91,11 @@ def validate(model, val_loader, args, device):
     
     # Print metrics
     if args.rank == 0:
-        print('\nValidation Results:')
-        print(f'mAP@0.5: {stats[0]:.4f}')
-        print(f'mAP@0.5:0.95: {stats[1]:.4f}')
-        print(f'Precision: {stats[2]:.4f}')
-        print(f'Recall: {stats[3]:.4f}')
+        LOGGER.info('\nValidation Results:')
+        LOGGER.info(f'mAP@0.5: {stats[0]:.4f}')
+        LOGGER.info(f'mAP@0.5:0.95: {stats[1]:.4f}')
+        LOGGER.info(f'Precision: {stats[2]:.4f}')
+        LOGGER.info(f'Recall: {stats[3]:.4f}')
     
     return stats
 
@@ -98,15 +103,22 @@ def train(args):
     # Setup distributed training
     setup_distributed(args)
     
+    # Initialize device
+    device = select_device(args.device)
+    
     # Initialize mixed precision
-    scaler = torch.cuda.amp.GradScaler() if args.mixed_precision else None
+    scaler = torch.amp.GradScaler('cuda') if args.mixed_precision and device.type != 'cpu' else None
     
-    # Load datasets with distributed sampler
-    source_dataset = build_yolo_dataset(args.source_data, args.img_size, args.batch_size, args.workers)
-    target_dataset = build_yolo_dataset(args.target_data, args.img_size, args.batch_size, args.workers)
+    # Load dataset configurations
+    with open(args.source_data) as f:
+        source_cfg = yaml.safe_load(f)
+    with open(args.target_data) as f:
+        target_cfg = yaml.safe_load(f)
     
-    # Create validation dataset from source domain
-    val_dataset = build_yolo_dataset(args.source_data, args.img_size, args.batch_size, args.workers, split='val')
+    # Build datasets
+    source_dataset = build_yolo_dataset(source_cfg, args.img_size, args.batch_size, args.workers)
+    target_dataset = build_yolo_dataset(target_cfg, args.img_size, args.batch_size, args.workers)
+    val_dataset = build_yolo_dataset(source_cfg, args.img_size, args.batch_size, args.workers, split='val')
     
     if args.local_rank != -1:
         source_sampler = DistributedSampler(source_dataset)
@@ -122,7 +134,7 @@ def train(args):
     
     # Initialize model
     model = DomainAdaptiveYOLOv8(cfg='yolov8n.yaml', ch=3, nc=source_dataset.nc)
-    model = model.to(args.device)
+    model = model.to(device)
     
     if args.local_rank != -1:
         model = DDP(model, device_ids=[args.local_rank])
@@ -152,13 +164,16 @@ def train(args):
         optimizer.zero_grad()
         domain_optimizer.zero_grad()
         
-        for batch_idx, ((source_imgs, source_targets), (target_imgs, _)) in enumerate(zip(source_loader, target_loader)):
-            source_imgs = source_imgs.to(args.device)
-            target_imgs = target_imgs.to(args.device)
-            source_targets = source_targets.to(args.device)
+        pbar = enumerate(zip(source_loader, target_loader))
+        pbar = tqdm(pbar, total=len(source_loader), bar_format=TQDM.bar_format)
+        
+        for batch_idx, ((source_imgs, source_targets), (target_imgs, _)) in pbar:
+            source_imgs = source_imgs.to(device)
+            target_imgs = target_imgs.to(device)
+            source_targets = source_targets.to(device)
             
             # Mixed precision forward pass
-            with torch.cuda.amp.autocast() if args.mixed_precision else torch.no_grad():
+            with torch.cuda.amp.autocast() if args.mixed_precision and device.type != 'cpu' else torch.no_grad():
                 # Source domain forward pass
                 source_detections, source_domain_pred = model(source_imgs, alpha, return_domain=True)
                 
@@ -169,8 +184,8 @@ def train(args):
                 detection_loss = detection_criterion(source_detections, source_targets)
                 
                 # Domain classification loss
-                source_domain_labels = torch.ones(source_domain_pred.size(0), 1).to(args.device)
-                target_domain_labels = torch.zeros(target_domain_pred.size(0), 1).to(args.device)
+                source_domain_labels = torch.ones(source_domain_pred.size(0), 1).to(device)
+                target_domain_labels = torch.zeros(target_domain_pred.size(0), 1).to(device)
                 
                 domain_loss = (domain_criterion(source_domain_pred, source_domain_labels) +
                              domain_criterion(target_domain_pred, target_domain_labels)) / 2
@@ -179,7 +194,7 @@ def train(args):
                 loss = (detection_loss + domain_loss) / args.gradient_accumulation_steps
             
             # Mixed precision backward pass
-            if args.mixed_precision:
+            if args.mixed_precision and device.type != 'cpu':
                 scaler.scale(loss).backward()
                 if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
                     scaler.step(optimizer)
@@ -198,6 +213,12 @@ def train(args):
             total_loss += loss.item() * args.gradient_accumulation_steps
             total_domain_loss += domain_loss.item()
             
+            # Update progress bar
+            pbar.set_description(f'Epoch {epoch+1}/{args.epochs} '
+                               f'loss: {loss.item():.4f} '
+                               f'det: {detection_loss.item():.4f} '
+                               f'dom: {domain_loss.item():.4f}')
+            
             # Clear memory
             if batch_idx % args.chunk_size == 0:
                 gc.collect()
@@ -207,11 +228,11 @@ def train(args):
         if args.rank == 0:
             avg_loss = total_loss / len(source_loader)
             avg_domain_loss = total_domain_loss / len(source_loader)
-            print(f'Epoch {epoch+1}/{args.epochs} - Loss: {avg_loss:.4f} - Domain Loss: {avg_domain_loss:.4f}')
+            LOGGER.info(f'Epoch {epoch+1}/{args.epochs} - Loss: {avg_loss:.4f} - Domain Loss: {avg_domain_loss:.4f}')
             
             # Validation
             if (epoch + 1) % args.val_interval == 0:
-                stats = validate(model, val_loader, args, args.device)
+                stats = validate(model, val_loader, args, device)
                 current_map = stats[1]  # mAP@0.5:0.95
                 
                 # Save best model
@@ -225,7 +246,7 @@ def train(args):
                         'domain_optimizer_state_dict': domain_optimizer.state_dict(),
                         'mAP': current_map,
                     }, save_path)
-                    print(f'New best model saved with mAP: {current_map:.4f}')
+                    LOGGER.info(f'New best model saved with mAP: {current_map:.4f}')
             
             # Save checkpoint
             if (epoch + 1) % 10 == 0:
