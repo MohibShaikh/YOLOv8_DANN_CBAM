@@ -1,0 +1,19 @@
+# NEU-GC640 Dataset configuration
+path: neugc640  # path to your dataset root
+train: train/images  # path to train images
+valid: valid/images    # path to validation images
+test: test/images  # path to test images
+
+# NEU-GC640 Classes
+nc: 10  # number of classes
+names:
+- crazing
+- inclusion
+- patches
+- pitted_surface
+- rolled-in_scale
+- scratches
+- crescent_gap
+- waist_folding
+- water_spot
+- oil_spot

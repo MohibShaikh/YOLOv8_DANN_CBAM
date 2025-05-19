@@ -1,0 +1,13 @@
+train: ./neugc10/train/images
+val: ./neugc10/valid/images
+test: ./neugc10/test/images
+
+nc: 15
+names: ['crazing', 'crease', 'crescent_gap', 'inclusion', 'oil_spot', 'patches', 'pitted_surface', 'punching_hole', 'rolled-in_scale', 'rolled_pit', 'scratches', 'silk_spot', 'waist_folding', 'water_spot', 'welding_line']
+
+roboflow:
+  workspace: bzzzz
+  project: final-truck
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/bzzzz/final-truck/dataset/1
