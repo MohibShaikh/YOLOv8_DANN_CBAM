@@ -79,7 +79,7 @@ sample_data/
 *.zip
 dataset/
 neugc640/
-neugc10/
+# neugc10/
 !dataset.yaml
 
 # System files
