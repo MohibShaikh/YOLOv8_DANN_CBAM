@@ -104,7 +104,11 @@ def train(args):
     setup_distributed(args)
     
     # Initialize device
-    device = select_device(args.device)
+    if torch.cuda.is_available():
+        device = select_device(args.device)
+    else:
+        LOGGER.warning('CUDA not available, using CPU instead')
+        device = torch.device('cpu')
     
     # Initialize mixed precision
     scaler = torch.amp.GradScaler('cuda') if args.mixed_precision and device.type != 'cpu' else None
@@ -115,10 +119,35 @@ def train(args):
     with open(args.target_data) as f:
         target_cfg = yaml.safe_load(f)
     
+    # Create dataset configurations
+    source_dataset_cfg = {
+        'path': source_cfg['path'],
+        'train': source_cfg['train'],
+        'val': source_cfg['val'],
+        'test': source_cfg.get('test', ''),
+        'names': source_cfg['names'],
+        'nc': len(source_cfg['names']),
+        'imgsz': args.img_size,
+        'batch': args.batch_size,
+        'workers': args.workers
+    }
+    
+    target_dataset_cfg = {
+        'path': target_cfg['path'],
+        'train': target_cfg['train'],
+        'val': target_cfg['val'],
+        'test': target_cfg.get('test', ''),
+        'names': target_cfg['names'],
+        'nc': len(target_cfg['names']),
+        'imgsz': args.img_size,
+        'batch': args.batch_size,
+        'workers': args.workers
+    }
+    
     # Build datasets
-    source_dataset = build_yolo_dataset(source_cfg, args.img_size, args.batch_size, args.workers)
-    target_dataset = build_yolo_dataset(target_cfg, args.img_size, args.batch_size, args.workers)
-    val_dataset = build_yolo_dataset(source_cfg, args.img_size, args.batch_size, args.workers, split='val')
+    source_dataset = build_yolo_dataset(source_dataset_cfg)
+    target_dataset = build_yolo_dataset(target_dataset_cfg)
+    val_dataset = build_yolo_dataset(source_dataset_cfg, split='val')
     
     if args.local_rank != -1:
         source_sampler = DistributedSampler(source_dataset)
@@ -172,8 +201,28 @@ def train(args):
             target_imgs = target_imgs.to(device)
             source_targets = source_targets.to(device)
             
-            # Mixed precision forward pass
-            with torch.cuda.amp.autocast() if args.mixed_precision and device.type != 'cpu' else torch.no_grad():
+            # Forward pass
+            if args.mixed_precision and device.type != 'cpu':
+                with torch.cuda.amp.autocast():
+                    # Source domain forward pass
+                    source_detections, source_domain_pred = model(source_imgs, alpha, return_domain=True)
+                    
+                    # Target domain forward pass
+                    _, target_domain_pred = model(target_imgs, alpha, return_domain=True)
+                    
+                    # Detection loss
+                    detection_loss = detection_criterion(source_detections, source_targets)
+                    
+                    # Domain classification loss
+                    source_domain_labels = torch.ones(source_domain_pred.size(0), 1).to(device)
+                    target_domain_labels = torch.zeros(target_domain_pred.size(0), 1).to(device)
+                    
+                    domain_loss = (domain_criterion(source_domain_pred, source_domain_labels) +
+                                 domain_criterion(target_domain_pred, target_domain_labels)) / 2
+                    
+                    # Total loss
+                    loss = (detection_loss + domain_loss) / args.gradient_accumulation_steps
+            else:
                 # Source domain forward pass
                 source_detections, source_domain_pred = model(source_imgs, alpha, return_domain=True)
                 
@@ -193,7 +242,7 @@ def train(args):
                 # Total loss
                 loss = (detection_loss + domain_loss) / args.gradient_accumulation_steps
             
-            # Mixed precision backward pass
+            # Backward pass
             if args.mixed_precision and device.type != 'cpu':
                 scaler.scale(loss).backward()
                 if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
@@ -222,7 +271,8 @@ def train(args):
             # Clear memory
             if batch_idx % args.chunk_size == 0:
                 gc.collect()
-                torch.cuda.empty_cache()
+                if device.type != 'cpu':
+                    torch.cuda.empty_cache()
         
         # Print epoch statistics
         if args.rank == 0:
