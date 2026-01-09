@@ -128,42 +128,36 @@ class DomainAdaptiveYOLOv8(DetectionModel):
                 self.model[i] = CBAMC2f(m.c, m.c, m.n, m.shortcut, m.g, m.e)
         
         # Add domain classifier
-        self.domain_classifier = DomainClassifier(self.model[-1].cv3.conv.out_channels)
+        last_feature_map_in_channels = self.model[-1].cv2[-1][0].conv.in_channels
+        self.domain_classifier = DomainClassifier(last_feature_map_in_channels)
         
         # Initialize weights
         initialize_weights(self)
         
     def forward(self, x, alpha=1.0, return_domain=False):
-        # Process in chunks to save memory
-        batch_size = x.size(0)
-        chunk_size = min(batch_size, 32)  # Process 32 images at a time
-        
-        all_detections = []
-        all_features = []
-        
-        for i in range(0, batch_size, chunk_size):
-            chunk = x[i:i + chunk_size]
-            
-            # Get features from backbone and neck
-            features = []
-            for m in self.model:
-                chunk = m(chunk)
-                if m == self.model[-1]:  # Last layer
-                    features.append(chunk)
-            
-            # Detection head forward pass
-            detections = super().forward(chunk)
-            
-            all_detections.append(detections)
-            all_features.extend(features)
-        
-        detections = torch.cat(all_detections, dim=0)
-        
+        """
+        Forward pass through the model. It works similar to `ultralytics.nn.tasks.BaseModel._forward_once`.
+        We manually iterate through the model layers to extract features for the domain classifier.
+        """
+        y = []
+        features_for_domain_classifier = None
+        for i, m in enumerate(self.model):
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+
+            if i == len(self.model) - 1:  # Just before the DetectionHead
+                # x is a list of feature maps. We'll use the last one for domain classification.
+                features_for_domain_classifier = x[-1]
+
+            x = m(x)  # run layer
+            y.append(x if m.i in self.save else None)  # save output
+
+        detections = x
+
         if return_domain:
-            # Domain classification
-            domain_pred = self.domain_classifier(all_features[-1], alpha)
+            domain_pred = self.domain_classifier(features_for_domain_classifier, alpha)
             return detections, domain_pred
-        
+
         return detections
     
     def predict(self, source, target=None, alpha=1.0, **kwargs):
