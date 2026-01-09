@@ -60,26 +60,61 @@ names: ['person', 'bicycle', ...]  # class names
 
 ## Model Architecture
 
-1. **CBAM Integration**:
-   - Channel Attention: Learns channel-wise feature importance
-   - Spatial Attention: Learns spatial feature importance
-   - Integrated into YOLOv8n backbone and neck
+This project integrates two key techniques into the YOLOv8n architecture: the **Convolutional Block Attention Module (CBAM)** and **Domain-Adversarial Neural Networks (DANN)**.
 
-2. **DANN Implementation**:
-   - Gradient Reversal Layer (GRL)
-   - Domain Classifier
-   - Progressive domain adaptation with increasing alpha
+### 1. CBAM Integration
+
+CBAM is an attention mechanism that helps the model focus on important features and suppress irrelevant ones. It consists of two sequential sub-modules:
+
+-   **Channel Attention Module**: This module learns which channels in a feature map are most important. It computes a channel attention map by applying both average-pooling and max-pooling operations to the input feature map and feeding the results through a shared multi-layer perceptron (MLP).
+-   **Spatial Attention Module**: This module learns which spatial locations in a feature map are most informative. It generates a 2D spatial attention map by applying pooling operations along the channel axis and feeding the result through a convolutional layer.
+
+In this implementation, the standard `C2f` blocks in the YOLOv8n backbone and neck are replaced with `CBAMC2f` blocks, which apply CBAM to the output of the `C2f` module. This allows the model to learn more discriminative features for object detection.
+
+### 2. DANN Implementation
+
+DANN is a domain adaptation technique that encourages the model to learn features that are both discriminative for the main task (object detection) and invariant to the domain (e.g., synthetic vs. real images). It consists of three components:
+
+-   **Feature Extractor**: This is the main YOLOv8 backbone and neck, which extracts features from the input images.
+-   **Label Predictor**: This is the standard YOLOv8 detection head, which predicts bounding boxes and class labels from the extracted features.
+-   **Domain Classifier**: This is a separate head that is trained to distinguish between features from the source and target domains.
+
+The key component of DANN is the **Gradient Reversal Layer (GRL)**, which is placed between the feature extractor and the domain classifier.
 
 ## Training Process
 
-The training process optimizes two objectives:
-1. Object detection loss on source domain
-2. Domain classification loss between source and target domains
+The training process is designed to optimize two competing objectives simultaneously:
 
-The model learns to:
-- Detect objects accurately in the source domain
-- Extract domain-invariant features
-- Adapt to the target domain without labels
+1.  **Minimize the detection loss** on the labeled source domain.
+2.  **Maximize the domain classification loss** between the source and target domains.
+
+### Gradient Reversal Layer (GRL)
+
+During the forward pass, the GRL acts as an identity function, passing the features from the feature extractor to the domain classifier without modification. However, during the backward pass, the GRL reverses the gradient by multiplying it by a negative constant (`-alpha`).
+
+This gradient reversal has the following effect:
+
+-   The **domain classifier** is trained to minimize the domain classification error, learning to distinguish between source and target features.
+-   The **feature extractor** is trained to *maximize* the domain classification error, learning to produce features that are indistinguishable to the domain classifier.
+
+### Combined Loss Function
+
+The total loss function is a combination of the detection loss and the domain classification loss:
+
+`Total Loss = Detection Loss + Domain Loss`
+
+-   The **Detection Loss** is calculated only on the labeled source domain data and is backpropagated through the entire network (feature extractor and label predictor).
+-   The **Domain Loss** is a binary cross-entropy loss that measures how well the domain classifier can distinguish between the source and target domains. It is backpropagated through the domain classifier and, via the GRL, to the feature extractor.
+
+### Progressive Domain Adaptation
+
+To stabilize the training process, the influence of the domain classifier is gradually increased over time. This is achieved by using a variable `alpha` for the GRL, which is calculated as follows:
+
+`alpha = (2.0 / (1.0 + exp(-10 * epoch / total_epochs))) - 1`
+
+This formula causes `alpha` to increase from 0 to 1 as the training progresses. In the early epochs, the model focuses on learning the primary task of object detection. As `alpha` increases, the model is increasingly penalized for learning domain-specific features, forcing it to learn more domain-invariant representations.
+
+This process encourages the model to learn features that are robust and generalizable, allowing it to adapt from the labeled source domain to the unlabeled target domain.
 
 ## Version Control & .gitignore
 
