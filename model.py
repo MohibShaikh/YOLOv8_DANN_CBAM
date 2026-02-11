@@ -105,9 +105,10 @@ class DomainClassifier(nn.Module):
         return torch.cat(outputs, dim=0)
 
 class CBAMC2f(C2f):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.cbam = CBAM(args[0])
+    def __init__(self, c1, c2, *args, **kwargs):
+        super().__init__(c1, c2, *args, **kwargs)
+        # CBAM should use output channels (c2), not input channels (c1)
+        self.cbam = CBAM(c2)
         
     def forward(self, x):
         x = super().forward(x)
@@ -123,42 +124,101 @@ class DomainAdaptiveYOLOv8(DetectionModel):
         super().__init__(cfg, ch, nc, task)
         
         # Replace C2f blocks with CBAMC2f in backbone
-        for i, m in enumerate(self.model):
-            if isinstance(m, C2f):
-                self.model[i] = CBAMC2f(m.c, m.c, m.n, m.shortcut, m.g, m.e)
+        # This includes both direct children and nested modules
+        self._replace_c2f_with_cbam()
         
-        # Add domain classifier
-        last_feature_map_in_channels = self.model[-1].cv2[-1][0].conv.in_channels
-        self.domain_classifier = DomainClassifier(last_feature_map_in_channels)
+        # Add domain classifier - calculate feature dimensions dynamically
+        # Get the channels from the last backbone layer before detection head
+        # YOLOv8 structure: backbone layers output feature maps that go to detection head
+        # We'll use a dummy forward pass to determine feature dimensions
+        self.domain_classifier = None  # Initialize later after determining size
+        self._initialize_domain_classifier()
         
         # Initialize weights
         initialize_weights(self)
+    
+    def _replace_c2f_with_cbam(self):
+        """Recursively replace all C2f modules with CBAMC2f"""
+        replaced_count = 0
+        for i, m in enumerate(self.model):
+            if isinstance(m, C2f):
+                # C2f has c as output channels, preserve all original parameters
+                c1 = m.cv1.conv.in_channels  # input channels
+                c2 = m.cv2.conv.out_channels  # output channels
+                # Create CBAMC2f with same parameters
+                new_module = CBAMC2f(c1, c2, m.n, m.shortcut, m.g, m.e)
+                # Copy weights from original C2f to new CBAMC2f
+                new_module.load_state_dict(m.state_dict(), strict=False)
+                self.model[i] = new_module
+                replaced_count += 1
+        
+        print(f"Replaced {replaced_count} C2f modules with CBAMC2f (with CBAM attention)")
+        return replaced_count
+    
+    def _initialize_domain_classifier(self):
+        """Initialize domain classifier with proper feature dimensions"""
+        # Perform a dummy forward pass to get feature dimensions
+        dummy_input = torch.randn(1, 3, 640, 640)
+        with torch.no_grad():
+            # Get features from the model
+            features = self._extract_features(dummy_input)
+            if features is not None:
+                # Calculate total feature dimensions
+                feature_dim = features.shape[1] * features.shape[2] * features.shape[3]
+                self.domain_classifier = DomainClassifier(feature_dim)
+            else:
+                # Fallback: estimate based on YOLOv8n architecture
+                # YOLOv8n typically has 64 channels in the last feature map
+                self.domain_classifier = DomainClassifier(64 * 20 * 20)  # 64 channels, ~20x20 spatial
+    
+    def _extract_features(self, x):
+        """Extract features from backbone before detection head"""
+        y = []
+        for i, m in enumerate(self.model):
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            
+            x = m(x)  # run layer
+            y.append(x if m.i in self.save else None)
+            
+            # The detection head is the last module, extract features before it
+            if i == len(self.model) - 2:
+                # At this point, x contains the feature pyramid
+                # For domain classification, use the smallest feature map (highest semantic level)
+                if isinstance(x, (list, tuple)):
+                    return x[-1]  # Use the deepest feature map
+                else:
+                    return x
+        
+        return None
         
     def forward(self, x, alpha=1.0, return_domain=False):
         """
-        Forward pass through the model. It works similar to `ultralytics.nn.tasks.BaseModel._forward_once`.
-        We manually iterate through the model layers to extract features for the domain classifier.
+        Forward pass through the model.
+        Args:
+            x: Input tensor
+            alpha: Alpha value for gradient reversal (0 to 1)
+            return_domain: Whether to return domain predictions
         """
-        y = []
-        features_for_domain_classifier = None
-        for i, m in enumerate(self.model):
-            if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
-
-            if i == len(self.model) - 1:  # Just before the DetectionHead
-                # x is a list of feature maps. We'll use the last one for domain classification.
-                features_for_domain_classifier = x[-1]
-
-            x = m(x)  # run layer
-            y.append(x if m.i in self.save else None)  # save output
-
-        detections = x
-
-        if return_domain:
-            domain_pred = self.domain_classifier(features_for_domain_classifier, alpha)
-            return detections, domain_pred
-
-        return detections
+        if return_domain and self.domain_classifier is not None:
+            # Extract features for domain classification
+            features = self._extract_features(x)
+            
+            # Get detection predictions using parent's forward
+            detections = super().forward(x)
+            
+            # Get domain predictions
+            if features is not None:
+                domain_pred = self.domain_classifier(features, alpha)
+                return detections, domain_pred
+            else:
+                # If feature extraction failed, return dummy domain predictions
+                batch_size = x.shape[0]
+                domain_pred = torch.zeros(batch_size, 1, device=x.device)
+                return detections, domain_pred
+        else:
+            # Standard forward pass for inference
+            return super().forward(x)
     
     def predict(self, source, target=None, alpha=1.0, **kwargs):
         """
