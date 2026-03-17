@@ -80,30 +80,139 @@ python train.py \
 
 ## Model Architecture
 
-### CBAM (Convolutional Block Attention Module)
+```mermaid
+flowchart TB
+    subgraph Input
+        IMG["Input Image<br/>3 × 640 × 640"]
+    end
 
-Integrated into all C2f blocks in the YOLOv8 backbone:
+    subgraph BACKBONE["Backbone (Feature Extraction)"]
+        direction TB
+        P1["Conv2d<br/>3 → 16, k3, s2<br/>320 × 320"]
+        P2["Conv2d<br/>16 → 32, k3, s2<br/>160 × 160"]
+        CB1["CBAMC2f<br/>32 → 32, n=1<br/>160 × 160"]
+        P3["Conv2d<br/>32 → 64, k3, s2<br/>80 × 80"]
+        CB2["CBAMC2f<br/>64 → 64, n=2<br/>80 × 80"]
+        P4["Conv2d<br/>64 → 128, k3, s2<br/>40 × 40"]
+        CB3["CBAMC2f<br/>128 → 128, n=2<br/>40 × 40"]
+        P5["Conv2d<br/>128 → 256, k3, s2<br/>20 × 20"]
+        CB4["CBAMC2f<br/>256 → 256, n=1<br/>20 × 20"]
+        SPPF1["SPPF<br/>256 → 256<br/>20 × 20"]
 
-- **Channel Attention**: Average + max pooling to learn channel-wise feature importance
-- **Spatial Attention**: Channel-wise pooling to learn spatial feature importance
-- Sequential application (channel first, then spatial)
-- Preserves pretrained YOLOv8 weights; adds ~10-20% overhead
+        P1 --> P2 --> CB1 --> P3 --> CB2 --> P4 --> CB3 --> P5 --> CB4 --> SPPF1
+    end
 
-### DANN (Domain-Adversarial Neural Network)
+    subgraph NECK["Neck (PANet FPN)"]
+        direction TB
+        UP1["Upsample 2×<br/>20 → 40"]
+        CAT1["Concat<br/>256 + 128 = 384"]
+        CB5["CBAMC2f<br/>384 → 128, n=1<br/>40 × 40"]
+        UP2["Upsample 2×<br/>40 → 80"]
+        CAT2["Concat<br/>128 + 64 = 192"]
+        CB6["CBAMC2f<br/>192 → 64, n=1<br/>80 × 80"]
+        DW1["Conv2d<br/>64 → 64, k3, s2<br/>40 × 40"]
+        CAT3["Concat<br/>64 + 128 = 192"]
+        CB7["CBAMC2f<br/>192 → 128, n=1<br/>40 × 40"]
+        DW2["Conv2d<br/>128 → 128, k3, s2<br/>20 × 20"]
+        CAT4["Concat<br/>128 + 256 = 384"]
+        CB8["CBAMC2f<br/>384 → 256, n=1<br/>20 × 20"]
 
-Domain adaptation through gradient reversal:
+        UP1 --> CAT1 --> CB5 --> UP2 --> CAT2 --> CB6
+        CB6 --> DW1 --> CAT3 --> CB7 --> DW2 --> CAT4 --> CB8
+    end
 
-- **Gradient Reversal Layer (GRL)**: Reverses gradients during backpropagation with scaling factor alpha
-- **Domain Classifier**: Binary classifier (source vs target domain)
-- **Progressive Adaptation**: alpha increases from 0 to 1 following: `alpha = 2/(1+exp(-10p)) - 1`
-- Features extracted from the deepest backbone layer
+    subgraph DETECT["Detection Head"]
+        DET["Detect<br/>nc = 15<br/>Scales: P3, P4, P5"]
+        BBOX["BBox Output<br/>(x, y, w, h)"]
+        CLS["Class Output<br/>(15 classes)"]
+        DET --> BBOX
+        DET --> CLS
+    end
 
-### Training Objectives
+    subgraph DANN_BRANCH["DANN Branch (Domain Adaptation)"]
+        direction TB
+        HOOK["Feature Hook<br/>from last neck C2f"]
+        GRL["Gradient Reversal Layer<br/>α = 2/(1+e⁻¹⁰ᵖ) − 1"]
+        FLAT["Flatten"]
+        FC1["FC → 1024 + ReLU + Dropout(0.5)"]
+        FC2["FC → 512 + ReLU + Dropout(0.5)"]
+        FC3["FC → 1"]
+        DOM["Domain Prediction<br/>Source (1) / Target (0)"]
 
-1. **Detection loss** on source domain (labeled) using v8DetectionLoss
-2. **Domain classification loss** between source and target domains
+        HOOK --> GRL --> FLAT --> FC1 --> FC2 --> FC3 --> DOM
+    end
 
-The model learns domain-invariant features that transfer across inspection conditions without target domain labels.
+    subgraph CBAM_DETAIL["CBAMC2f Detail"]
+        direction TB
+        C2F_IN["C2f Block<br/>(Bottleneck × n)"]
+        subgraph CBAM["CBAM"]
+            direction TB
+            CA["Channel Attention<br/>AvgPool + MaxPool → FC → σ"]
+            SA["Spatial Attention<br/>AvgPool + MaxPool → Conv → σ"]
+            CA --> SA
+        end
+        C2F_OUT["Output Features"]
+        C2F_IN --> CBAM --> C2F_OUT
+    end
+
+    subgraph LOSSES["Training Losses"]
+        DET_LOSS["v8DetectionLoss<br/>(box + cls + dfl)<br/>Source domain only"]
+        DOM_LOSS["BCEWithLogitsLoss<br/>(source + target) / 2"]
+        TOTAL["Total Loss =<br/>Det Loss + Domain Loss"]
+        DET_LOSS --> TOTAL
+        DOM_LOSS --> TOTAL
+    end
+
+    IMG --> BACKBONE
+    SPPF1 --> NECK
+    CB3 -. "skip to concat" .-> CAT1
+    CB2 -. "skip to concat" .-> CAT2
+    CB5 -. "skip to concat" .-> CAT3
+    SPPF1 -. "skip to concat" .-> CAT4
+    CB6 --> DETECT
+    CB7 --> DETECT
+    CB8 --> DETECT
+    CB8 -. "forward hook" .-> DANN_BRANCH
+
+    BBOX --> DET_LOSS
+    CLS --> DET_LOSS
+    DOM --> DOM_LOSS
+
+    style BACKBONE fill:#1a1a2e,stroke:#e94560,color:#fff
+    style NECK fill:#16213e,stroke:#0f3460,color:#fff
+    style DETECT fill:#0f3460,stroke:#53a8b6,color:#fff
+    style DANN_BRANCH fill:#2d132c,stroke:#ee4540,color:#fff
+    style CBAM_DETAIL fill:#1b262c,stroke:#bbe1fa,color:#fff
+    style LOSSES fill:#1a1a2e,stroke:#e8d21d,color:#fff
+    style GRL fill:#ee4540,stroke:#fff,color:#fff
+    style CBAM fill:#0f3460,stroke:#bbe1fa,color:#fff
+```
+
+### Data Flow
+
+```
+Source Images ──→ Backbone+CBAM ──→ PANet Neck ──→ Detect Head ──→ Detection Loss
+                                         │
+                                         ├──→ GRL(α) ──→ Domain Classifier ──→ Domain Loss (source=1)
+                                         │
+Target Images ──→ Backbone+CBAM ──→ PANet Neck ──→ GRL(α) ──→ Domain Classifier ──→ Domain Loss (target=0)
+                                         │
+                                    (no det loss)
+
+Total Loss = Detection Loss (source only) + Domain Loss (source + target)
+α schedule: α = 2/(1 + exp(-10p)) − 1,  p = epoch/total_epochs  (0 → 1)
+```
+
+### Key Design Decisions
+
+| Component | Choice | Rationale |
+|-----------|--------|-----------|
+| Backbone | YOLOv8n | Lightweight, real-time capable |
+| Attention | CBAM on all C2f blocks | Improves feature discrimination with minimal overhead |
+| Domain features | Deepest neck feature map (20x20) | Highest semantic level for domain-invariant learning |
+| GRL schedule | Sigmoid ramp 0 to 1 | Gradual adaptation prevents early training instability |
+| Domain classifier | 3-layer MLP with dropout | Sufficient capacity without overfitting |
+| Detection loss | v8DetectionLoss (box+cls+dfl) | Native Ultralytics loss, not simplified BCE |
 
 ## Project Structure
 
