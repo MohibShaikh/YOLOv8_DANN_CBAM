@@ -71,7 +71,7 @@ class GradientReversalLayer(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, alpha):
         ctx.alpha = alpha
-        return x.view_as(x)
+        return x.clone()
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -116,13 +116,14 @@ class CBAMC2f(C2f):
 
 class DomainAdaptiveYOLOv8(DetectionModel):
     def __init__(self, cfg='yolov8n.yaml', ch=3, nc=None, task='detect'):
-        # Load YOLOv8 configuration
-        if isinstance(cfg, str):
-            cfg = get_cfg(cfg)
-        
-        # Initialize base model
-        super().__init__(cfg, ch, nc, task)
-        
+        # Initialize base model — DetectionModel resolves the YAML internally
+        super().__init__(cfg, ch, nc)
+
+        # Set args needed by v8DetectionLoss
+        if not hasattr(self, 'args'):
+            from ultralytics.cfg import get_cfg
+            self.args = get_cfg()
+
         # Replace C2f blocks with CBAMC2f in backbone
         # This includes both direct children and nested modules
         self._replace_c2f_with_cbam()
@@ -134,21 +135,37 @@ class DomainAdaptiveYOLOv8(DetectionModel):
         self.domain_classifier = None  # Initialize later after determining size
         self._initialize_domain_classifier()
         
+        # Register forward hook on the second-to-last layer to capture features
+        self._cached_features = None
+        self._feature_hook = self.model[-2].register_forward_hook(self._hook_features)
+
         # Initialize weights
         initialize_weights(self)
-    
+
+    def _hook_features(self, module, input, output):
+        """Forward hook that caches features from the layer before the detection head"""
+        if isinstance(output, (list, tuple)):
+            self._cached_features = output[-1]
+        else:
+            self._cached_features = output
+
     def _replace_c2f_with_cbam(self):
         """Recursively replace all C2f modules with CBAMC2f"""
         replaced_count = 0
         for i, m in enumerate(self.model):
-            if isinstance(m, C2f):
-                # C2f has c as output channels, preserve all original parameters
-                c1 = m.cv1.conv.in_channels  # input channels
-                c2 = m.cv2.conv.out_channels  # output channels
-                # Create CBAMC2f with same parameters
-                new_module = CBAMC2f(c1, c2, m.n, m.shortcut, m.g, m.e)
-                # Copy weights from original C2f to new CBAMC2f
+            if isinstance(m, C2f) and not isinstance(m, CBAMC2f):
+                c1 = m.cv1.conv.in_channels
+                c2 = m.cv2.conv.out_channels
+                n = len(m.m)  # number of Bottleneck blocks
+                shortcut = m.m[0].add if n > 0 else False
+                g = m.m[0].cv2.conv.groups if n > 0 else 1
+                e = m.c / c2 if c2 > 0 else 0.5  # m.c is hidden channels = c2 * e
+                new_module = CBAMC2f(c1, c2, n, shortcut, g, e)
                 new_module.load_state_dict(m.state_dict(), strict=False)
+                # Preserve model graph attributes set by DetectionModel
+                for attr in ('i', 'f', 'type', 'np'):
+                    if hasattr(m, attr):
+                        setattr(new_module, attr, getattr(m, attr))
                 self.model[i] = new_module
                 replaced_count += 1
         
@@ -158,7 +175,8 @@ class DomainAdaptiveYOLOv8(DetectionModel):
     def _initialize_domain_classifier(self):
         """Initialize domain classifier with proper feature dimensions"""
         # Perform a dummy forward pass to get feature dimensions
-        dummy_input = torch.randn(1, 3, 640, 640)
+        device = next(self.parameters()).device
+        dummy_input = torch.randn(1, 3, 640, 640, device=device)
         with torch.no_grad():
             # Get features from the model
             features = self._extract_features(dummy_input)
@@ -200,25 +218,20 @@ class DomainAdaptiveYOLOv8(DetectionModel):
             alpha: Alpha value for gradient reversal (0 to 1)
             return_domain: Whether to return domain predictions
         """
+        # Single forward pass — the hook captures features automatically
+        detections = super().forward(x)
+
         if return_domain and self.domain_classifier is not None:
-            # Extract features for domain classification
-            features = self._extract_features(x)
-            
-            # Get detection predictions using parent's forward
-            detections = super().forward(x)
-            
-            # Get domain predictions
+            features = self._cached_features
             if features is not None:
                 domain_pred = self.domain_classifier(features, alpha)
                 return detections, domain_pred
             else:
-                # If feature extraction failed, return dummy domain predictions
                 batch_size = x.shape[0]
                 domain_pred = torch.zeros(batch_size, 1, device=x.device)
                 return detections, domain_pred
-        else:
-            # Standard forward pass for inference
-            return super().forward(x)
+
+        return detections
     
     def predict(self, source, target=None, alpha=1.0, **kwargs):
         """

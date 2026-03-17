@@ -16,7 +16,12 @@ from model import DomainAdaptiveYOLOv8
 from ultralytics import YOLO
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.utils import LOGGER, RANK, colorstr
-from ultralytics.utils.torch_utils import select_device, de_parallel
+from ultralytics.utils.torch_utils import select_device
+from torch.nn.parallel import DataParallel, DistributedDataParallel
+
+def de_parallel(model):
+    """De-parallelize a model."""
+    return model.module if isinstance(model, (DataParallel, DistributedDataParallel)) else model
 from ultralytics.engine.validator import BaseValidator
 
 try:
@@ -93,43 +98,25 @@ class DomainAdaptiveTrainer:
         self.model = self.model.to(self.device)
         self.model.train()
         
+    def _build_loader(self, data_cfg, split='train', mode='train', rect=False):
+        """Build a YOLO dataset + dataloader from a data config dict."""
+        from ultralytics.cfg import get_cfg
+        cfg = get_cfg()  # default training config
+        cfg.imgsz = self.args.img_size
+
+        img_path = str(Path(data_cfg['path']) / data_cfg[split])
+        dataset = build_yolo_dataset(cfg, img_path, self.args.batch_size, data_cfg, mode=mode, rect=rect)
+        shuffle = mode == 'train'
+        return build_dataloader(dataset, self.args.batch_size, self.args.workers, shuffle=shuffle)
+
     def setup_dataloaders(self):
         """Setup source and target domain dataloaders"""
         LOGGER.info('Setting up dataloaders...')
-        
-        # Source domain dataloader
-        self.source_loader = build_dataloader(
-            dataset=None,
-            batch=self.args.batch_size,
-            img_path=Path(self.source_cfg['path']) / self.source_cfg['train'],
-            data=self.source_cfg,
-            mode='train',
-            rect=False,
-            workers=self.args.workers
-        )[0]
-        
-        # Target domain dataloader (unlabeled, but using same format)
-        self.target_loader = build_dataloader(
-            dataset=None,
-            batch=self.args.batch_size,
-            img_path=Path(self.target_cfg['path']) / self.target_cfg['train'],
-            data=self.target_cfg,
-            mode='train',
-            rect=False,
-            workers=self.args.workers
-        )[0]
-        
-        # Validation dataloader
-        self.val_loader = build_dataloader(
-            dataset=None,
-            batch=self.args.batch_size,
-            img_path=Path(self.source_cfg['path']) / self.source_cfg.get('val', 'valid'),
-            data=self.source_cfg,
-            mode='val',
-            rect=True,
-            workers=self.args.workers
-        )[0]
-        
+
+        self.source_loader = self._build_loader(self.source_cfg, split='train', mode='train')
+        self.target_loader = self._build_loader(self.target_cfg, split='train', mode='train')
+        self.val_loader = self._build_loader(self.source_cfg, split='val', mode='val', rect=True)
+
         LOGGER.info(f'Source batches: {len(self.source_loader)}, Target batches: {len(self.target_loader)}')
         
     def setup_training(self):
@@ -161,9 +148,9 @@ class DomainAdaptiveTrainer:
         Uses v8DetectionLoss if available, otherwise falls back to model's loss
         """
         if self.detection_criterion is not None:
-            # Use v8DetectionLoss
+            # Use v8DetectionLoss — returns [box, cls, dfl] losses
             loss, loss_items = self.detection_criterion(predictions, batch)
-            return loss, {'det_loss': loss}
+            return loss.sum(), {'det_loss': loss}
         else:
             # Fallback: use model's built-in loss if it exists
             if hasattr(self.model, 'loss'):
@@ -181,7 +168,7 @@ class DomainAdaptiveTrainer:
         
         # Calculate alpha for gradient reversal (increases from 0 to 1)
         progress = epoch / self.args.epochs
-        alpha = 2.0 / (1.0 + torch.exp(torch.tensor(-10 * progress))) - 1
+        alpha = 2.0 / (1.0 + torch.exp(torch.tensor(-10 * progress, device=self.device))) - 1
         alpha = alpha.item()
         
         # Create iterator that zips source and target
@@ -206,10 +193,7 @@ class DomainAdaptiveTrainer:
             # Source domain: detection + domain classification
             source_preds, source_domain_pred = self.model(source_imgs, alpha=alpha, return_domain=True)
             
-            # Target domain: domain classification only
-            with torch.no_grad():
-                # Don't need gradients for target predictions, only domain features
-                pass
+            # Target domain: domain classification only (no detection loss needed)
             _, target_domain_pred = self.model(target_imgs, alpha=alpha, return_domain=True)
             
             # Detection loss (only on source domain with labels)
@@ -255,32 +239,31 @@ class DomainAdaptiveTrainer:
     
     @torch.no_grad()
     def validate(self):
-        """Run validation"""
+        """Run validation using detection loss as a proxy metric"""
         self.model.eval()
-        
-        # Use YOLO's validation
-        validator = BaseValidator(
-            dataloader=self.val_loader,
-            save_dir=self.save_dir
-        )
-        
-        # Simple validation: just run inference and check if it works
+
         LOGGER.info('Running validation...')
-        n_correct = 0
-        n_total = 0
-        
+        total_loss = 0.0
+        n_batches = 0
+
         for batch in tqdm(self.val_loader, desc='Validating'):
             imgs = batch['img'].to(self.device, non_blocking=True).float() / 255.0
             preds = self.model(imgs)
-            n_total += imgs.shape[0]
-            # Simple check: model produces predictions
-            if preds is not None:
-                n_correct += imgs.shape[0]
-        
-        accuracy = n_correct / n_total if n_total > 0 else 0
-        LOGGER.info(f'Validation: {n_correct}/{n_total} batches successful ({accuracy:.2%})')
-        
-        return accuracy
+
+            try:
+                det_loss, _ = self.compute_detection_loss(preds, batch)
+                total_loss += det_loss.item()
+            except Exception:
+                # If loss computation fails, just count the batch
+                pass
+            n_batches += 1
+
+        avg_loss = total_loss / max(n_batches, 1)
+        # Return negative loss so higher = better (for best model selection)
+        score = 1.0 / (1.0 + avg_loss)
+        LOGGER.info(f'Validation: avg_loss={avg_loss:.4f}, score={score:.4f}')
+
+        return score
     
     def save_checkpoint(self, epoch, is_best=False):
         """Save model checkpoint"""
