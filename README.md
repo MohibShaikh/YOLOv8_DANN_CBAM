@@ -1,21 +1,29 @@
 # Domain-Adaptive YOLOv8 with CBAM and DANN
 
-This project implements a domain-adaptive object detector based on YOLOv8n, enhanced with CBAM (Convolutional Block Attention Module) and DANN (Domain-Adversarial Neural Network) for improved cross-domain detection performance.
+A domain-adaptive object detector based on YOLOv8n, enhanced with CBAM (Convolutional Block Attention Module) and DANN (Domain-Adversarial Neural Network) for cross-domain steel defect detection.
 
 ## Features
 
-- YOLOv8n backbone with CBAM attention mechanism
-- Domain adaptation using DANN
-- Support for both labeled (source) and unlabeled (target) domains
-- Compatible with Ultralytics YOLO format
-- Efficient implementation for edge deployment
+- YOLOv8n backbone with CBAM attention on all C2f blocks
+- Domain adaptation using DANN with gradient reversal
+- Source/target domain split with synthetic augmentations to simulate camera/lighting shifts
+- Google Colab notebook for easy training on GPU
+- NEU-GC10 steel defect dataset (15 classes) via Roboflow
+
+## Dataset
+
+This project uses the **NEU-GC10** steel surface defect dataset with 15 classes:
+
+`crazing`, `crease`, `crescent_gap`, `inclusion`, `oil_spot`, `patches`, `pitted_surface`, `punching_hole`, `rolled-in_scale`, `rolled_pit`, `scratches`, `silk_spot`, `waist_folding`, `water_spot`, `welding_line`
+
+The dataset is auto-downloaded from Roboflow when using the Colab notebook.
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/MohibShaikh/yolov8_dann_cbam.git
-cd yolov8_dann_cbam
+git clone https://github.com/MohibShaikh/YOLOv8_DANN_CBAM.git
+cd YOLOv8_DANN_CBAM
 ```
 
 2. Install dependencies:
@@ -23,123 +31,93 @@ cd yolov8_dann_cbam
 pip install -r requirements.txt
 ```
 
-If using Google Colab, you may need to restart the runtime after installation.
-
 ## Usage
 
-### Training
+### Google Colab (Recommended)
 
-To train the model with domain adaptation:
+Open `YOLOv8_DANN_CBAM_Colab.ipynb` in Google Colab. It handles dataset download, domain experiment setup, and training automatically.
+
+### Local Training
+
+#### 1. Prepare the dataset
+
+Download the NEU-GC10 dataset and place it under `neugc10/`.
+
+#### 2. Set up the domain experiment
+
+Split the dataset into source and target domains with synthetic augmentations:
+
+```bash
+python setup_domain_experiment.py
+```
+
+This creates `datasets/neu_domain_experiment/` with `source.yaml` and `target.yaml` configs. Target domain images are augmented with brightness reduction, color temperature shift, Gaussian noise, and blur to simulate different inspection conditions.
+
+#### 3. Train
 
 ```bash
 python train.py \
-    --source-data path/to/source/data.yaml \
-    --target-data path/to/target/data.yaml \
-    --epochs 100 \
-    --batch-size 16 \
+    --source-data datasets/neu_domain_experiment/source.yaml \
+    --target-data datasets/neu_domain_experiment/target.yaml \
+    --epochs 50 \
+    --batch-size 8 \
     --img-size 640 \
-    --device cuda \
-    --workers 8 \
-    --save-dir runs/domain_adaptive \
-    --pretrained yolov8n.pt \
-    --lr 0.001 \
-    --val-interval 5
+    --device cuda
 ```
 
 **Parameters:**
-- `--source-data`: Path to source domain dataset YAML
-- `--target-data`: Path to target domain dataset YAML (can be unlabeled)
+- `--source-data`: Source domain dataset YAML
+- `--target-data`: Target domain dataset YAML
 - `--epochs`: Number of training epochs (default: 100)
-- `--batch-size`: Batch size for training (default: 16)
+- `--batch-size`: Batch size (default: 16)
 - `--img-size`: Input image size (default: 640)
-- `--device`: Device to use (cuda:0, cpu, etc.)
-- `--workers`: Number of data loading workers (default: 8)
-- `--save-dir`: Directory to save checkpoints and results
-- `--pretrained`: Path to pretrained YOLOv8 weights (default: yolov8n.pt)
+- `--device`: Device to use (`cuda`, `cpu`)
+- `--workers`: Data loading workers (default: 8)
+- `--save-dir`: Checkpoint directory (default: `runs/domain_adaptive`)
+- `--pretrained`: Pretrained YOLOv8 weights (default: `yolov8n.pt`)
 - `--lr`: Learning rate (default: 0.001)
 - `--val-interval`: Validation interval in epochs (default: 5)
 
-### Dataset Format
-
-Both source and target datasets should follow the Ultralytics YOLO format:
-
-```yaml
-# data.yaml
-path: path/to/dataset
-train: images/train
-val: images/val
-test: images/test
-
-nc: 80  # number of classes
-names: ['person', 'bicycle', ...]  # class names
-```
-
 ## Model Architecture
 
-### 1. CBAM Integration (Convolutional Block Attention Module)
+### CBAM (Convolutional Block Attention Module)
 
-The CBAM attention mechanism is integrated into all C2f blocks in the YOLOv8 backbone:
+Integrated into all C2f blocks in the YOLOv8 backbone:
 
-- **Channel Attention**: Uses both average and max pooling to learn channel-wise feature importance
-- **Spatial Attention**: Uses channel-wise pooling to learn spatial feature importance
-- **Sequential Application**: Channel attention is applied first, followed by spatial attention
-- **Memory Efficient**: Processes features in chunks to reduce memory footprint
+- **Channel Attention**: Average + max pooling to learn channel-wise feature importance
+- **Spatial Attention**: Channel-wise pooling to learn spatial feature importance
+- Sequential application (channel first, then spatial)
+- Preserves pretrained YOLOv8 weights; adds ~10-20% overhead
 
-**Key Features:**
-- Automatically replaces all C2f modules with CBAMC2f during model initialization
-- Preserves pretrained weights from standard YOLOv8
-- Adds minimal computational overhead (~10-20%)
+### DANN (Domain-Adversarial Neural Network)
 
-### 2. DANN Implementation (Domain-Adversarial Neural Networks)
+Domain adaptation through gradient reversal:
 
-Domain adaptation is achieved through gradient reversal:
+- **Gradient Reversal Layer (GRL)**: Reverses gradients during backpropagation with scaling factor alpha
+- **Domain Classifier**: Binary classifier (source vs target domain)
+- **Progressive Adaptation**: alpha increases from 0 to 1 following: `alpha = 2/(1+exp(-10p)) - 1`
+- Features extracted from the deepest backbone layer
 
-- **Gradient Reversal Layer (GRL)**: Reverses gradients during backpropagation with scaling factor α
-- **Domain Classifier**: Binary classifier to distinguish source vs target domain
-- **Progressive Adaptation**: α increases from 0 to 1 following schedule: α = 2/(1+exp(-10p)) - 1
-- **Feature Extraction**: Uses features from the deepest backbone layer (highest semantic level)
+### Training Objectives
 
-**Key Features:**
-- Domain classifier initialized with proper feature dimensions via dummy forward pass
-- Memory-efficient chunked processing for large batch sizes
-- Balanced domain loss using equal weighting for source and target domains
+1. **Detection loss** on source domain (labeled) using v8DetectionLoss
+2. **Domain classification loss** between source and target domains
 
-### 3. Architecture Improvements
+The model learns domain-invariant features that transfer across inspection conditions without target domain labels.
 
-**Recent Fixes:**
-- ✅ Fixed CBAM channel dimension bug (now uses output channels correctly)
-- ✅ Robust domain classifier initialization (no hardcoded feature dimensions)
-- ✅ Proper integration with YOLOv8's forward pass
-- ✅ Correct YOLO detection loss (uses v8DetectionLoss instead of BCE)
-- ✅ Verified CBAM is applied to all C2f blocks
-- ✅ Verified DANN gradient reversal works correctly
+## Project Structure
 
-## Training Process
-
-The training process optimizes two objectives:
-1. Object detection loss on source domain
-2. Domain classification loss between source and target domains
-
-The model learns to:
-- Detect objects accurately in the source domain
-- Extract domain-invariant features
-- Adapt to the target domain without labels
-
-## Version Control & .gitignore
-
-This repository includes a `.gitignore` file tailored for deep learning projects. It excludes:
-- Checkpoints, logs, and model weights
-- Dataset and output folders
-- Python cache and build files
-- IDE/editor settings (VSCode, PyCharm, etc.)
-- Colab and Jupyter notebook checkpoints
-
-**Best practices:**
-- Commit only code, configuration, and small metadata files (like `dataset.yaml`).
-- Do not commit large datasets, model weights, or outputs.
-- Use branches for experimental features.
-- Document major changes in your commit messages.
+```
+├── model.py                     # CBAM, DANN, DomainAdaptiveYOLOv8
+├── train.py                     # Training script
+├── setup_domain_experiment.py   # Source/target domain split + augmentation
+├── prepare_dataset.py           # Dataset verification utility
+├── dataset.yaml                 # Dataset config
+├── requirements.txt             # Dependencies
+├── YOLOv8_DANN_CBAM_Colab.ipynb # Colab notebook
+└── neugc10/                     # NEU-GC10 dataset (not committed)
+```
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details. 
+This project is licensed under the MIT License - see the LICENSE file for details.
