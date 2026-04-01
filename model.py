@@ -12,48 +12,27 @@ class ChannelAttention(nn.Module):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
-        
+
         self.fc = nn.Sequential(
             nn.Linear(channels, channels // reduction_ratio, bias=False),
             nn.ReLU(inplace=True),
             nn.Linear(channels // reduction_ratio, channels, bias=False)
         )
-        
+
     def forward(self, x):
-        # Process in chunks to save memory
-        batch_size = x.size(0)
-        chunk_size = min(batch_size, 32)  # Process 32 images at a time
-        
-        outputs = []
-        for i in range(0, batch_size, chunk_size):
-            chunk = x[i:i + chunk_size]
-            avg_out = self.fc(self.avg_pool(chunk).view(chunk.size(0), -1))
-            max_out = self.fc(self.max_pool(chunk).view(chunk.size(0), -1))
-            out = avg_out + max_out
-            outputs.append(torch.sigmoid(out).view(chunk.size(0), -1, 1, 1))
-            
-        return torch.cat(outputs, dim=0)
+        avg_out = self.fc(self.avg_pool(x).view(x.size(0), -1))
+        max_out = self.fc(self.max_pool(x).view(x.size(0), -1))
+        return torch.sigmoid(avg_out + max_out).view(x.size(0), -1, 1, 1)
 
 class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super().__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2)
-        
+
     def forward(self, x):
-        # Process in chunks to save memory
-        batch_size = x.size(0)
-        chunk_size = min(batch_size, 32)  # Process 32 images at a time
-        
-        outputs = []
-        for i in range(0, batch_size, chunk_size):
-            chunk = x[i:i + chunk_size]
-            avg_out = torch.mean(chunk, dim=1, keepdim=True)
-            max_out, _ = torch.max(chunk, dim=1, keepdim=True)
-            x_cat = torch.cat([avg_out, max_out], dim=1)
-            out = self.conv(x_cat)
-            outputs.append(torch.sigmoid(out))
-            
-        return torch.cat(outputs, dim=0)
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        return torch.sigmoid(self.conv(torch.cat([avg_out, max_out], dim=1)))
 
 class CBAM(nn.Module):
     def __init__(self, channels, reduction_ratio=16, kernel_size=7):
@@ -80,6 +59,7 @@ class GradientReversalLayer(torch.autograd.Function):
 class DomainClassifier(nn.Module):
     def __init__(self, input_channels, hidden_size=1024):
         super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Sequential(
             nn.Linear(input_channels, hidden_size),
             nn.ReLU(inplace=True),
@@ -89,20 +69,11 @@ class DomainClassifier(nn.Module):
             nn.Dropout(0.5),
             nn.Linear(hidden_size // 2, 1)
         )
-        
+
     def forward(self, x, alpha=1.0):
-        # Process in chunks to save memory
-        batch_size = x.size(0)
-        chunk_size = min(batch_size, 32)  # Process 32 images at a time
-        
-        outputs = []
-        for i in range(0, batch_size, chunk_size):
-            chunk = x[i:i + chunk_size]
-            chunk = GradientReversalLayer.apply(chunk, alpha)
-            chunk = chunk.view(chunk.size(0), -1)
-            outputs.append(self.classifier(chunk))
-            
-        return torch.cat(outputs, dim=0)
+        x = GradientReversalLayer.apply(x, alpha)
+        x = self.pool(x).view(x.size(0), -1)
+        return self.classifier(x)
 
 class CBAMC2f(C2f):
     def __init__(self, c1, c2, *args, **kwargs):
@@ -174,20 +145,15 @@ class DomainAdaptiveYOLOv8(DetectionModel):
     
     def _initialize_domain_classifier(self):
         """Initialize domain classifier with proper feature dimensions"""
-        # Perform a dummy forward pass to get feature dimensions
         device = next(self.parameters()).device
         dummy_input = torch.randn(1, 3, 640, 640, device=device)
         with torch.no_grad():
-            # Get features from the model
             features = self._extract_features(dummy_input)
             if features is not None:
-                # Calculate total feature dimensions
-                feature_dim = features.shape[1] * features.shape[2] * features.shape[3]
-                self.domain_classifier = DomainClassifier(feature_dim)
+                # Only need channel count -- AdaptiveAvgPool2d(1) in DomainClassifier handles spatial dims
+                self.domain_classifier = DomainClassifier(features.shape[1])
             else:
-                # Fallback: estimate based on YOLOv8n architecture
-                # YOLOv8n typically has 64 channels in the last feature map
-                self.domain_classifier = DomainClassifier(64 * 20 * 20)  # 64 channels, ~20x20 spatial
+                self.domain_classifier = DomainClassifier(256)
     
     def _extract_features(self, x):
         """Extract features from backbone before detection head"""
@@ -248,17 +214,16 @@ class DomainAdaptiveYOLOv8(DetectionModel):
         return source_pred
     
     def export(self, **kwargs):
-        """
-        Export model to ONNX format
-        """
-        # Remove domain classifier for export
+        """Export model to ONNX format"""
+        # Remove domain classifier and hook for export
         domain_classifier = self.domain_classifier
         self.domain_classifier = None
-        
-        # Export base model
+        self._feature_hook.remove()
+
         exported_model = super().export(**kwargs)
-        
-        # Restore domain classifier
+
+        # Restore domain classifier and hook
         self.domain_classifier = domain_classifier
-        
-        return exported_model 
+        self._feature_hook = self.model[-2].register_forward_hook(self._hook_features)
+
+        return exported_model

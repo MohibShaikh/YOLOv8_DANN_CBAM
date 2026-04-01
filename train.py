@@ -142,6 +142,12 @@ class DomainAdaptiveTrainer:
         # Track best mAP
         self.best_map = 0.0
         
+    def _batch_to_device(self, batch):
+        """Move batch label tensors to training device."""
+        for k in ('batch_idx', 'cls', 'bboxes'):
+            if k in batch and isinstance(batch[k], torch.Tensor):
+                batch[k] = batch[k].to(self.device, non_blocking=True)
+
     def compute_detection_loss(self, predictions, batch):
         """
         Compute YOLO detection loss
@@ -190,12 +196,14 @@ class DomainAdaptiveTrainer:
             
             self.optimizer.zero_grad()
             
+            self._batch_to_device(source_batch)
+
             # Source domain: detection + domain classification
             source_preds, source_domain_pred = self.model(source_imgs, alpha=alpha, return_domain=True)
-            
+
             # Target domain: domain classification only (no detection loss needed)
             _, target_domain_pred = self.model(target_imgs, alpha=alpha, return_domain=True)
-            
+
             # Detection loss (only on source domain with labels)
             det_loss, loss_dict = self.compute_detection_loss(source_preds, source_batch)
             
@@ -230,10 +238,11 @@ class DomainAdaptiveTrainer:
             })
         
         # Return average losses
+        n = max(n_batches, 1)
         return {
-            'loss': epoch_loss / n_batches,
-            'detection_loss': epoch_det_loss / n_batches,
-            'domain_loss': epoch_dom_loss / n_batches,
+            'loss': epoch_loss / n,
+            'detection_loss': epoch_det_loss / n,
+            'domain_loss': epoch_dom_loss / n,
             'alpha': alpha
         }
     
@@ -251,11 +260,11 @@ class DomainAdaptiveTrainer:
             preds = self.model(imgs)
 
             try:
+                self._batch_to_device(batch)
                 det_loss, _ = self.compute_detection_loss(preds, batch)
                 total_loss += det_loss.item()
-            except Exception:
-                # If loss computation fails, just count the batch
-                pass
+            except Exception as e:
+                LOGGER.warning(f'Validation loss computation failed: {e}')
             n_batches += 1
 
         avg_loss = total_loss / max(n_batches, 1)

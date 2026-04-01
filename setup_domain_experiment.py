@@ -122,12 +122,22 @@ def setup_experiment(dataset_root, output_root, target_ratio=0.4):
             shutil.copy2(lbl_path, tgt_lbl_out / lbl_path.name)
 
     # --- Write YAML configs ---
-    class_names = [
-        'crazing', 'crease', 'crescent_gap', 'inclusion', 'oil_spot',
-        'patches', 'pitted_surface', 'punching_hole', 'rolled-in_scale',
-        'rolled_pit', 'scratches', 'silk_spot', 'waist_folding', 'water_spot',
-        'welding_line'
-    ]
+    # Read class names from dataset's own data.yaml if available
+    data_yaml = dataset_root / 'data.yaml'
+    if data_yaml.exists():
+        with open(data_yaml) as f:
+            ds_cfg = yaml.safe_load(f)
+        class_names = ds_cfg.get('names', [])
+        print(f'Read {len(class_names)} classes from {data_yaml}')
+    else:
+        # Fallback for NEU-GC10
+        class_names = [
+            'crazing', 'crease', 'crescent_gap', 'inclusion', 'oil_spot',
+            'patches', 'pitted_surface', 'punching_hole', 'rolled-in_scale',
+            'rolled_pit', 'scratches', 'silk_spot', 'waist_folding', 'water_spot',
+            'welding_line'
+        ]
+        print(f'Using default {len(class_names)} GC10 class names (no data.yaml found)')
 
     source_yaml = {
         'path': str(source_dir.resolve()),
